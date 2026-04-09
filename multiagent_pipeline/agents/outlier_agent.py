@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
+from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
 from multiagent_pipeline.state import (
@@ -135,16 +136,40 @@ def run_outlier_agent(
         logger.info("Z-score: score_z range [%.4f, %.4f]",
                     out["score_z"].min(), out["score_z"].max())
 
-        # ── Ensemble pesata ───────────────────────────────────────────────────
-        # AE non implementato: ripartiamo il suo peso su IF e LOF
-        w_if  = ENSEMBLE_WEIGHTS["IF"]  + ENSEMBLE_WEIGHTS["AE"] * 0.5
-        w_lof = ENSEMBLE_WEIGHTS["LOF"] + ENSEMBLE_WEIGHTS["AE"] * 0.5
-        w_z   = ENSEMBLE_WEIGHTS["Z"]
+        # ── 4. Autoencoder (MLPRegressor) ────────────────────────────────────
+        # Identico al notebook classico 04: architettura 11→8→4→8→11,
+        # addestrato solo sulle rotte normali (semi-supervised via IsolationForest).
+        normal_mask = if_model.predict(X_scaled) == 1
+        X_normal = X_scaled[normal_mask]
+        logger.info("Autoencoder: training su %d rotte normali (su %d totali)",
+                    X_normal.shape[0], X_scaled.shape[0])
 
+        n_features = X_scaled.shape[1]
+        ae = MLPRegressor(
+            hidden_layer_sizes=(8, 4, 8),
+            activation="relu",
+            solver="adam",
+            learning_rate_init=0.001,
+            max_iter=2000,
+            random_state=_RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.10,
+            n_iter_no_change=20,
+            verbose=False,
+        )
+        ae.fit(X_normal, X_normal)
+        X_reconstructed = ae.predict(X_scaled)
+        ae_error = np.mean((X_scaled - X_reconstructed) ** 2, axis=1)
+        out["score_ae"] = _minmax(pd.Series(ae_error, index=out.index))
+        logger.info("Autoencoder: score_ae range [%.4f, %.4f]",
+                    out["score_ae"].min(), out["score_ae"].max())
+
+        # ── Ensemble pesata — pesi identici al classico ───────────────────────
         out["ensemble_score"] = (
-            out["score_if"]  * w_if  +
-            out["score_lof"] * w_lof +
-            out["score_z"]   * w_z
+            out["score_if"]  * ENSEMBLE_WEIGHTS["IF"]  +
+            out["score_lof"] * ENSEMBLE_WEIGHTS["LOF"] +
+            out["score_z"]   * ENSEMBLE_WEIGHTS["Z"]   +
+            out["score_ae"]  * ENSEMBLE_WEIGHTS["AE"]
         ).clip(0, 1)
         logger.info("Ensemble: range [%.4f, %.4f]",
                     out["ensemble_score"].min(), out["ensemble_score"].max())
@@ -176,7 +201,7 @@ def run_outlier_agent(
             "soglia_alta"     : threshold_alta,
             "soglia_media"    : threshold_media,
             "threshold_method": "data-driven (p97/p90)",
-            "metodo_ensemble" : "IF + LOF + Z-score (sklearn reali)",
+            "metodo_ensemble" : "IF + LOF + Z-score + Autoencoder (sklearn reali)",
             "feature_cols"    : feat_cols,
             "n_features"      : len(feat_cols),
             "saved_to"        : saved_to,
