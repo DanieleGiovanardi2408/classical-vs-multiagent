@@ -1,8 +1,15 @@
 """OutlierAgent — quarto nodo del grafo multi-agent.
 
-Responsabilità:
-    Combina più segnali anomaly-like in uno score ensemble e assegna
-    una risk label (NORMALE/MEDIA/ALTA) per ogni rotta.
+Responsabilità (dalla slide Reply):
+    "Applies IsolationForest, LOF, or Z-score on the engineered features"
+
+Implementa i tre modelli reali su sklearn, identici al notebook classico 04:
+    - IsolationForest  (contamination=0.03, random_state=42)
+    - LocalOutlierFactor (n_neighbors=20, contamination=0.03)
+    - Z-score          (sulle BASELINE_FEATURES, già calcolato da BaselineAgent)
+
+Ensemble pesata con gli stessi ENSEMBLE_WEIGHTS del classico.
+Soglie data-driven (p97/p90) per coerenza con notebook 05.
 """
 from __future__ import annotations
 
@@ -18,25 +25,53 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
 
 from multiagent_pipeline.state import (
     AgentState,
+    BASELINE_FEATURES,
     ENSEMBLE_WEIGHTS,
-    THRESHOLD_ALTA,
-    THRESHOLD_MEDIA,
 )
 
 logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# Stessi iperparametri del notebook classico 04
+_CONTAMINATION  = 0.03
+_N_NEIGHBORS    = 20
+_RANDOM_STATE   = 42
+
 
 def _minmax(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").fillna(0.0)
-    s_min = float(s.min())
-    s_max = float(s.max())
-    if s_max <= s_min:
+    lo, hi = float(s.min()), float(s.max())
+    if hi <= lo:
         return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - s_min) / (s_max - s_min)
+    return (s - lo) / (hi - lo)
+
+
+def _get_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Seleziona le feature numeriche disponibili per i modelli ML.
+
+    Usa BASELINE_FEATURES se presenti, altrimenti tutte le colonne numeriche
+    escluse quelle di metadato/score già calcolati.
+    """
+    exclude = {"ZONA", "n_osservazioni_allarmi", "n_osservazioni_viag",
+               "score_composito", "baseline_score", "baseline_flag"}
+    exclude |= {c for c in df.columns if c.startswith("z_")}
+
+    # Priorità: BASELINE_FEATURES presenti nel df
+    bl_cols = [c for c in BASELINE_FEATURES if c in df.columns]
+    if bl_cols:
+        cols = bl_cols
+    else:
+        cols = [c for c in df.select_dtypes(include="number").columns
+                if c not in exclude]
+
+    X = df[cols].fillna(0.0)
+    return X, cols
 
 
 def run_outlier_agent(
@@ -44,7 +79,7 @@ def run_outlier_agent(
     save_output: bool = False,
     output_path: Path | str | None = None,
 ) -> AgentState:
-    """Calcola score ensemble e risk label su `state['df_baseline']`."""
+    """Applica IsolationForest, LOF e Z-score su df_baseline → ensemble score."""
     logger.info("OutlierAgent -- Avvio")
     started_at = time.perf_counter()
 
@@ -56,39 +91,72 @@ def run_outlier_agent(
             raise ValueError("df_baseline vuoto: impossibile stimare outlier.")
 
         out = df.copy()
+        X, feat_cols = _get_feature_matrix(out)
+        logger.info("Feature usate per ML: %d colonne — %s", len(feat_cols), feat_cols)
 
-        # Segnali base (deterministici) per approssimare IF/LOF/Z/AE.
-        out["score_if"] = _minmax(out["score_composito"]) if "score_composito" in out.columns else 0.0
-        out["score_lof"] = _minmax(out["baseline_score"]) if "baseline_score" in out.columns else 0.0
+        # ── Normalizzazione ───────────────────────────────────────────────────
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
 
+        # ── 1. IsolationForest ────────────────────────────────────────────────
+        if_model = IsolationForest(
+            contamination=_CONTAMINATION,
+            random_state=_RANDOM_STATE,
+            n_estimators=100,
+        )
+        # decision_function: più basso = più anomalo → invertiamo e normalizziamo
+        if_raw = if_model.fit(X_scaled).decision_function(X_scaled)
+        out["score_if"] = _minmax(pd.Series(-if_raw, index=out.index))
+        logger.info("IsolationForest: score_if range [%.4f, %.4f]",
+                    out["score_if"].min(), out["score_if"].max())
+
+        # ── 2. LocalOutlierFactor ─────────────────────────────────────────────
+        n_neighbors = min(_N_NEIGHBORS, len(out) - 1)
+        lof_model = LocalOutlierFactor(
+            n_neighbors=n_neighbors,
+            contamination=_CONTAMINATION,
+        )
+        lof_raw = lof_model.fit_predict(X_scaled)          # -1 anomalo, 1 normale
+        lof_scores = lof_model.negative_outlier_factor_    # più negativo = più anomalo
+        out["score_lof"] = _minmax(pd.Series(-lof_scores, index=out.index))
+        logger.info("LOF: score_lof range [%.4f, %.4f]",
+                    out["score_lof"].min(), out["score_lof"].max())
+
+        # ── 3. Z-score (dalle colonne z_ prodotte da BaselineAgent) ──────────
         z_cols = [c for c in out.columns if c.startswith("z_")]
-        z_proxy = out[z_cols].abs().mean(axis=1) if z_cols else pd.Series(np.zeros(len(out)), index=out.index)
+        if z_cols:
+            z_proxy = out[z_cols].abs().mean(axis=1)
+        else:
+            # Fallback: z-score calcolato sul posto sulle feature
+            z_proxy = pd.Series(
+                np.abs(X_scaled).mean(axis=1), index=out.index
+            )
         out["score_z"] = _minmax(z_proxy)
+        logger.info("Z-score: score_z range [%.4f, %.4f]",
+                    out["score_z"].min(), out["score_z"].max())
 
-        # Proxy AE: combinazione IF/LOF (stabile e bounded).
-        out["score_ae"] = ((out["score_if"] + out["score_lof"]) / 2).clip(0, 1)
+        # ── Ensemble pesata ───────────────────────────────────────────────────
+        # AE non implementato: ripartiamo il suo peso su IF e LOF
+        w_if  = ENSEMBLE_WEIGHTS["IF"]  + ENSEMBLE_WEIGHTS["AE"] * 0.5
+        w_lof = ENSEMBLE_WEIGHTS["LOF"] + ENSEMBLE_WEIGHTS["AE"] * 0.5
+        w_z   = ENSEMBLE_WEIGHTS["Z"]
 
-        # Ensemble pesata con pesi condivisi nel contratto.
         out["ensemble_score"] = (
-            out["score_if"] * ENSEMBLE_WEIGHTS["IF"] +
-            out["score_lof"] * ENSEMBLE_WEIGHTS["LOF"] +
-            out["score_z"] * ENSEMBLE_WEIGHTS["Z"] +
-            out["score_ae"] * ENSEMBLE_WEIGHTS["AE"]
+            out["score_if"]  * w_if  +
+            out["score_lof"] * w_lof +
+            out["score_z"]   * w_z
         ).clip(0, 1)
+        logger.info("Ensemble: range [%.4f, %.4f]",
+                    out["ensemble_score"].min(), out["ensemble_score"].max())
 
-        # Soglie data-driven sul dataset corrente (p97/p90),
-        # identico al metodo del classico (notebook 05).
-        # Le costanti THRESHOLD_ALTA/MEDIA di state.py erano calibrate
-        # sulla distribuzione classica (score medio 0.14) e non sono
-        # trasferibili al multiagent (score medio ~0.42).
+        # ── Soglie data-driven (p97/p90) — identico al classico notebook 05 ──
         threshold_alta  = float(out["ensemble_score"].quantile(0.97))
         threshold_media = float(out["ensemble_score"].quantile(0.90))
         logger.info("Soglie data-driven: ALTA=%.4f (p97) | MEDIA=%.4f (p90)",
                     threshold_alta, threshold_media)
 
         out["risk_label"] = np.where(
-            out["ensemble_score"] >= threshold_alta,
-            "ALTA",
+            out["ensemble_score"] >= threshold_alta, "ALTA",
             np.where(out["ensemble_score"] >= threshold_media, "MEDIA", "NORMALE"),
         )
 
@@ -102,34 +170,39 @@ def run_outlier_agent(
             logger.info("OutlierAgent output salvato in: %s", saved_to)
 
         meta = {
-            "n_alta": int((out["risk_label"] == "ALTA").sum()),
-            "n_media": int((out["risk_label"] == "MEDIA").sum()),
-            "n_normale": int((out["risk_label"] == "NORMALE").sum()),
-            "soglia_alta": threshold_alta,
-            "soglia_media": threshold_media,
+            "n_alta"          : int((out["risk_label"] == "ALTA").sum()),
+            "n_media"         : int((out["risk_label"] == "MEDIA").sum()),
+            "n_normale"       : int((out["risk_label"] == "NORMALE").sum()),
+            "soglia_alta"     : threshold_alta,
+            "soglia_media"    : threshold_media,
             "threshold_method": "data-driven (p97/p90)",
-            "metodo_ensemble": "weighted_average",
-            "saved_to": saved_to,
-            "top_rotte": out.sort_values("ensemble_score", ascending=False)
-            .head(10)[["ROTTA", "ensemble_score", "risk_label"]]
-            .to_dict(orient="records"),
+            "metodo_ensemble" : "IF + LOF + Z-score (sklearn reali)",
+            "feature_cols"    : feat_cols,
+            "n_features"      : len(feat_cols),
+            "saved_to"        : saved_to,
+            "top_rotte"       : (
+                out.sort_values("ensemble_score", ascending=False)
+                .head(10)[["ROTTA", "ensemble_score", "risk_label"]]
+                .to_dict(orient="records")
+            ),
             "elapsed_s": round(time.perf_counter() - started_at, 3),
         }
 
         logger.info(
-            "OutlierAgent ✓ Completato — ALTA=%d MEDIA=%d NORMALE=%d",
-            meta["n_alta"], meta["n_media"], meta["n_normale"],
+            "OutlierAgent ✓ Completato — ALTA=%d MEDIA=%d NORMALE=%d (%.2fs)",
+            meta["n_alta"], meta["n_media"], meta["n_normale"], meta["elapsed_s"],
         )
         return {**state, "df_anomalies": out, "anomaly_meta": meta}
+
     except Exception as e:
         logger.error("OutlierAgent ✗ Errore: %s", e)
         return {
             **state,
             "df_anomalies": None,
             "anomaly_meta": {
-                "error": str(e),
-                "user_message": "Outlier detection fallita: verifica output baseline e filtri selezionati.",
-                "elapsed_s": round(time.perf_counter() - started_at, 3),
+                "error"       : str(e),
+                "user_message": "Outlier detection fallita: verifica output baseline e filtri.",
+                "elapsed_s"   : round(time.perf_counter() - started_at, 3),
             },
         }
 
@@ -149,4 +222,10 @@ if __name__ == "__main__":
     s = run_baseline_agent(s)
     s = run_outlier_agent(s)
     print("\n=== RISULTATO OutlierAgent ===")
-    print(s["anomaly_meta"])
+    am = s["anomaly_meta"]
+    print(f"  ALTA={am['n_alta']} | MEDIA={am['n_media']} | NORMALE={am['n_normale']}")
+    print(f"  soglia_alta={am['soglia_alta']:.4f} | soglia_media={am['soglia_media']:.4f}")
+    print(f"  metodo: {am['metodo_ensemble']}")
+    print(f"  features: {am['n_features']} colonne")
+    print(f"  elapsed: {am['elapsed_s']}s")
+    print(f"  top rotte: {am['top_rotte'][:3]}")
