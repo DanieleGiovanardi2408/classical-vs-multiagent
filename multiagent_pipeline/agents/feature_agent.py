@@ -172,11 +172,14 @@ def run_feature_agent(
 
 
 if __name__ == "__main__":
+    from multiagent_pipeline.tools.data_tools import load_last_perimeter
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
-    out = run_feature_agent({"perimeter": {"anno": 2024}})
+    _perimeter = load_last_perimeter() or {"anno": 2024}
+    print(f"  Perimetro: {_perimeter}")
+    out = run_feature_agent({"perimeter": _perimeter})
     print("\n=== RISULTATO FeatureAgent ===")
     print("df_features shape:", out["df_features"].shape)
     print("n_features numeriche:", len(out["feature_meta"]["feature_cols"]))

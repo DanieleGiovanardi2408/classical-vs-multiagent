@@ -5,10 +5,32 @@ Testabili in isolazione con pytest.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DATA_AGENT_MANIFEST = _PROJECT_ROOT / "data" / "processed" / "data_agent_output.json"
+
+
+def load_last_perimeter() -> dict:
+    """Legge il perimetro dell'ultima esecuzione del DataAgent dal manifest su disco.
+
+    Utile nei blocchi __main__ degli agent standalone: invece di hardcodare
+    {"anno": 2024}, si usa sempre l'ultimo perimetro scelto interattivamente.
+    Restituisce {} se il manifest non esiste o è illeggibile.
+    """
+    if not _DATA_AGENT_MANIFEST.exists():
+        return {}
+    try:
+        manifest = json.loads(_DATA_AGENT_MANIFEST.read_text())
+        raw = manifest.get("perimeter", {})
+        # Filtra i valori None (campi non impostati dal Perimeter Pydantic)
+        return {k: v for k, v in raw.items() if v is not None}
+    except Exception:
+        return {}
 
 
 def load_dataset(path: Path | str) -> pd.DataFrame:
