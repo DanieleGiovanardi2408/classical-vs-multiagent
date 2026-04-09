@@ -265,9 +265,7 @@ def data_agent_node(state: AgentState, save_artifacts: bool = False) -> AgentSta
         stats["n_righe_allarmi"] = int(len(df_allarmi))
         stats["n_righe_viaggiatori"] = int(len(df_viaggiatori))
 
-        # 7. Salvataggio opzionale: 1 manifest JSON + 3 CSV filtrati
-        # (merged/allarmi/viaggiatori). Quando attivo abilita l'handoff
-        # cross-process al FeatureAgent, che legge l'artefatto se presente.
+        # 7. Salva artefatti su disco (audit + handoff cross-process)
         if save_artifacts:
             DATA_AGENT_OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
             df_raw.to_csv(DATA_AGENT_OUTPUT_CSV, index=False)
@@ -437,6 +435,7 @@ if __name__ == "__main__":
     print("── Risultato ─────────────────────────────────────────")
     if stato_finale["data_meta"].get("error"):
         print(f"  ERRORE: {stato_finale['data_meta']['error']}")
+        print("=" * 55)
     else:
         meta = stato_finale["data_meta"]
         print(f"  Righe caricate:    {meta['n_righe']}")
@@ -447,4 +446,48 @@ if __name__ == "__main__":
         print(f"  df_raw shape:      {stato_finale['df_raw'].shape}")
         print(f"  df_allarmi shape:  {stato_finale['df_allarmi'].shape}")
         print(f"  df_viag shape:     {stato_finale['df_viaggiatori'].shape}")
-    print("=" * 55)
+        print("=" * 55)
+
+        # ── Catena interattiva ──────────────────────────────────
+        CHAIN = [
+            ("FeatureAgent",  "run_feature_agent",  "multiagent_pipeline.agents.feature_agent"),
+            ("BaselineAgent", "run_baseline_agent", "multiagent_pipeline.agents.baseline_agent"),
+            ("OutlierAgent",  "run_outlier_agent",  "multiagent_pipeline.agents.outlier_agent"),
+            ("ReportAgent",   "run_report_agent",   "multiagent_pipeline.agents.report_agent"),
+        ]
+
+        state = stato_finale
+        for agent_name, fn_name, module_path in CHAIN:
+            risposta = input(f"\nVuoi runnare {agent_name}? [s/N] ").strip().lower()
+            if risposta not in ("s", "si", "sì", "y", "yes"):
+                print(f"  ↳ {agent_name} saltato. Fine.")
+                break
+            import importlib
+            mod = importlib.import_module(module_path)
+            fn  = getattr(mod, fn_name)
+            print(f"\n── {agent_name} ──────────────────────────────────────")
+            state = fn(state)
+            # Stampa risultato sintetico per ogni agent
+            if agent_name == "FeatureAgent":
+                fm = state.get("feature_meta") or {}
+                if "error" in fm:
+                    print(f"  ERRORE: {fm['error']}")
+                    break
+                print(f"  df_features: {state['df_features'].shape} | quality: {fm.get('quality',{}).get('null_totali','?')} null")
+            elif agent_name == "BaselineAgent":
+                bm = state.get("baseline_meta") or {}
+                if "error" in bm:
+                    print(f"  ERRORE: {bm['error']}")
+                    break
+                print(f"  df_baseline: {state['df_baseline'].shape} | soglia_alta={bm.get('soglia_alta')} | soglia_media={bm.get('soglia_media')}")
+            elif agent_name == "OutlierAgent":
+                am = state.get("anomaly_meta") or {}
+                if "error" in am:
+                    print(f"  ERRORE: {am['error']}")
+                    break
+                print(f"  ALTA={am.get('n_alta')} | MEDIA={am.get('n_media')} | NORMALE={am.get('n_normale')}")
+            elif agent_name == "ReportAgent":
+                rp = state.get("report_path")
+                rs = (state.get("report") or {}).get("summary", "N/A")
+                print(f"  Report salvato: {rp}")
+                print(f"  Sommario: {rs}")
