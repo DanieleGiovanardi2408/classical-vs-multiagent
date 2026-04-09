@@ -76,10 +76,20 @@ def run_outlier_agent(
             out["score_ae"] * ENSEMBLE_WEIGHTS["AE"]
         ).clip(0, 1)
 
+        # Soglie data-driven sul dataset corrente (p97/p90),
+        # identico al metodo del classico (notebook 05).
+        # Le costanti THRESHOLD_ALTA/MEDIA di state.py erano calibrate
+        # sulla distribuzione classica (score medio 0.14) e non sono
+        # trasferibili al multiagent (score medio ~0.42).
+        threshold_alta  = float(out["ensemble_score"].quantile(0.97))
+        threshold_media = float(out["ensemble_score"].quantile(0.90))
+        logger.info("Soglie data-driven: ALTA=%.4f (p97) | MEDIA=%.4f (p90)",
+                    threshold_alta, threshold_media)
+
         out["risk_label"] = np.where(
-            out["ensemble_score"] >= THRESHOLD_ALTA,
+            out["ensemble_score"] >= threshold_alta,
             "ALTA",
-            np.where(out["ensemble_score"] >= THRESHOLD_MEDIA, "MEDIA", "NORMALE"),
+            np.where(out["ensemble_score"] >= threshold_media, "MEDIA", "NORMALE"),
         )
 
         saved_to = None
@@ -95,8 +105,9 @@ def run_outlier_agent(
             "n_alta": int((out["risk_label"] == "ALTA").sum()),
             "n_media": int((out["risk_label"] == "MEDIA").sum()),
             "n_normale": int((out["risk_label"] == "NORMALE").sum()),
-            "soglia_alta": float(THRESHOLD_ALTA),
-            "soglia_media": float(THRESHOLD_MEDIA),
+            "soglia_alta": threshold_alta,
+            "soglia_media": threshold_media,
+            "threshold_method": "data-driven (p97/p90)",
             "metodo_ensemble": "weighted_average",
             "saved_to": saved_to,
             "top_rotte": out.sort_values("ensemble_score", ascending=False)
