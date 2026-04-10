@@ -40,9 +40,10 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Stessi iperparametri del notebook classico 04
-_CONTAMINATION  = 0.03
+_CONTAMINATION  = 0.10   # classico: contamination=0.10 (10% rotte anomale attese)
 _N_NEIGHBORS    = 20
 _RANDOM_STATE   = 42
+_N_ESTIMATORS   = 200    # classico: 200 alberi per IsolationForest
 
 
 def _minmax(series: pd.Series) -> pd.Series:
@@ -103,7 +104,7 @@ def run_outlier_agent(
         if_model = IsolationForest(
             contamination=_CONTAMINATION,
             random_state=_RANDOM_STATE,
-            n_estimators=100,
+            n_estimators=_N_ESTIMATORS,
         )
         # decision_function: più basso = più anomalo → invertiamo e normalizziamo
         if_raw = if_model.fit(X_scaled).decision_function(X_scaled)
@@ -113,11 +114,14 @@ def run_outlier_agent(
 
         # ── 2. LocalOutlierFactor ─────────────────────────────────────────────
         n_neighbors = min(_N_NEIGHBORS, len(out) - 1)
+        if n_neighbors < _N_NEIGHBORS:
+            logger.warning("LOF: n_neighbors ridotto a %d (dataset ha solo %d righe)",
+                           n_neighbors, len(out))
         lof_model = LocalOutlierFactor(
             n_neighbors=n_neighbors,
             contamination=_CONTAMINATION,
         )
-        lof_raw = lof_model.fit_predict(X_scaled)          # -1 anomalo, 1 normale
+        lof_model.fit(X_scaled)
         lof_scores = lof_model.negative_outlier_factor_    # più negativo = più anomalo
         out["score_lof"] = _minmax(pd.Series(-lof_scores, index=out.index))
         logger.info("LOF: score_lof range [%.4f, %.4f]",
@@ -144,7 +148,6 @@ def run_outlier_agent(
         logger.info("Autoencoder: training su %d rotte normali (su %d totali)",
                     X_normal.shape[0], X_scaled.shape[0])
 
-        n_features = X_scaled.shape[1]
         ae = MLPRegressor(
             hidden_layer_sizes=(8, 4, 8),
             activation="relu",
